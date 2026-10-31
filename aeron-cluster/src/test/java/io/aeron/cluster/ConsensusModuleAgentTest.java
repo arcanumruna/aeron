@@ -25,6 +25,7 @@ import io.aeron.Subscription;
 import io.aeron.UnavailableImageHandler;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.archive.client.ArchiveException;
+import io.aeron.archive.client.RecordingSignalPoller;
 import io.aeron.cluster.client.ClusterEvent;
 import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.codecs.ClusterAction;
@@ -33,6 +34,7 @@ import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusterMarkFile;
 import io.aeron.cluster.service.ClusterTerminationException;
 import io.aeron.driver.DutyCycleTracker;
+import io.aeron.exceptions.AeronException;
 import io.aeron.logbuffer.Header;
 import io.aeron.security.AuthorisationService;
 import io.aeron.security.DefaultAuthenticatorSupplier;
@@ -58,6 +60,8 @@ import org.mockito.InOrder;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongConsumer;
 
@@ -78,6 +82,7 @@ import static java.lang.Boolean.TRUE;
 import static org.agrona.concurrent.status.CountersReader.COUNTER_LENGTH;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -87,12 +92,15 @@ import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.anyLong;
 import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.atLeast;
+import static org.mockito.Mockito.contains;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -103,6 +111,22 @@ class ConsensusModuleAgentTest
     private static final String RESPONSE_CHANNEL_TWO = "aeron:udp?endpoint=localhost:22222";
     private static final int SCHEMA_ID = 17;
     private static final int UPDATE_INTERVAL_MS = 19;
+    private static final String CATCHUP_CLUSTER_MEMBERS =
+        "0,localhost:20000,localhost:20001,localhost:20002,localhost:0,localhost:8010|" +
+        "1,localhost:20100,localhost:20101,localhost:20102,localhost:0,localhost:8011|" +
+        "2,localhost:20200,localhost:20201,localhost:20202,localhost:0,localhost:8012";
+    private static final long CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS = TimeUnit.SECONDS.toNanos(1);
+    private static final long CATCHUP_LEADERSHIP_TERM_ID = 3;
+    private static final long CATCHUP_LOG_RECORDING_ID = 7;
+    private static final int CATCHUP_FOLLOWER_ID = 1;
+    private static final String CATCHUP_ENDPOINT = "localhost:30001";
+    private static final long CATCHUP_REPLAY_SESSION_ID = 42;
+    private static final long CATCHUP_REPLAY_CORRELATION_ID = 160;
+    private static final String CLASHING_SESSION_ID_ERROR =
+        "response for correlationId=150, error: failed to create replay publication: " +
+        "io.aeron.exceptions.RegistrationException: ERROR - existing publication has clashing " +
+        "sessionId=-2095880762 for streamId=100 channel=aeron:udp?endpoint=localhost:30001|" +
+        "alias=catchup-followerId-1|eos=false";
 
     private final EgressPublisher mockEgressPublisher = mock(EgressPublisher.class);
     private final LogPublisher mockLogPublisher = mock(LogPublisher.class);
@@ -1034,5 +1058,260 @@ class ConsensusModuleAgentTest
             assertNull(Tests.getField(agent, "recordingLogValidator"));
             verify(mockValidatorArchive).close();
         }
+    }
+
+    @Test
+    void shouldRetryRefusedCatchupReplayOnALaterSlowTick()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final List<Long> attemptTimesNs = new ArrayList<>();
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenAnswer(
+            (invocation) ->
+            {
+                attemptTimesNs.add(clock.timeNanos());
+                if (1 == attemptTimesNs.size())
+                {
+                    throw new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150);
+                }
+                return CATCHUP_REPLAY_SESSION_ID;
+            });
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+        final ClusterMember follower = clusterMember(agent, CATCHUP_FOLLOWER_ID);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
+        assertEquals(NULL_VALUE, follower.catchupReplaySessionId());
+
+        slowTicks(agent, clock, CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
+
+        assertEquals(2, attemptTimesNs.size());
+        final long retryDelayNs = attemptTimesNs.get(1) - attemptTimesNs.get(0);
+        assertTrue(retryDelayNs >= CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS / 4, "retryDelayNs=" + retryDelayNs);
+        assertTrue(retryDelayNs < CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS, "retryDelayNs=" + retryDelayNs);
+        assertEquals(CATCHUP_REPLAY_SESSION_ID, follower.catchupReplaySessionId());
+        assertEquals(CATCHUP_REPLAY_CORRELATION_ID, follower.catchupReplayCorrelationId());
+        verify(archive, times(2)).startReplay(
+            eq(CATCHUP_LOG_RECORDING_ID),
+            eq(1024L),
+            eq(Long.MAX_VALUE),
+            contains("endpoint=" + CATCHUP_ENDPOINT),
+            eq(ctx.logStreamId()));
+        assertEquals(List.of(), catchupReplayErrors());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { CLASHING_SESSION_ID_ERROR, "response for correlationId=150, error: replay not ready" })
+    void shouldStopRetryingCatchupReplayAndRecordOneErrorOnceLeaderHeartbeatTimeoutHasPassed(final String error)
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final List<Long> attemptTimesNs = new ArrayList<>();
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenAnswer(
+            (invocation) ->
+            {
+                attemptTimesNs.add(clock.timeNanos());
+                throw new ArchiveException(error, ArchiveException.GENERIC, 150);
+            });
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+        final ClusterMember follower = clusterMember(agent, CATCHUP_FOLLOWER_ID);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
+        slowTicks(agent, clock, CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS + 2 * SLOW_TICK_INTERVAL_NS);
+
+        final int attempts = attemptTimesNs.size();
+        assertTrue(attempts > 1, "attempts=" + attempts);
+        final long lastAttemptDelayNs = attemptTimesNs.get(attempts - 1) - attemptTimesNs.get(0);
+        assertTrue(
+            lastAttemptDelayNs < CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS, "lastAttemptDelayNs=" + lastAttemptDelayNs);
+
+        final List<Throwable> errors = catchupReplayErrors();
+        assertEquals(1, errors.size());
+        final ClusterEvent event = assertInstanceOf(ClusterEvent.class, errors.get(0));
+        assertEquals(AeronException.Category.WARN, event.category());
+        assertTrue(event.getMessage().contains(error), event.getMessage());
+
+        slowTicks(agent, clock, CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
+
+        assertEquals(attempts, attemptTimesNs.size());
+        assertEquals(1, catchupReplayErrors().size());
+        assertEquals(NULL_VALUE, follower.catchupReplaySessionId());
+    }
+
+    @Test
+    void shouldCancelCatchupReplayRetryWhenAllCatchupsAreStopped()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt()))
+            .thenThrow(new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150));
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
+        agent.stopAllCatchups();
+        slowTicks(agent, clock, 2 * CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
+
+        verify(archive, times(1)).startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt());
+        assertEquals(List.of(), catchupReplayErrors());
+    }
+
+    @Test
+    void shouldCancelCatchupReplayRetryWhenLeaderStepsDown()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt()))
+            .thenThrow(new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150));
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
+        agent.role(Cluster.Role.FOLLOWER);
+        agent.role(Cluster.Role.LEADER);
+        slowTicks(agent, clock, 2 * CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
+
+        verify(archive, times(1)).startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt());
+        assertEquals(List.of(), catchupReplayErrors());
+    }
+
+    @Test
+    void shouldReplacePendingCatchupReplayWhenFollowerSendsANewCatchupPosition()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final List<Long> positions = new ArrayList<>();
+        final List<String> channels = new ArrayList<>();
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenAnswer(
+            (invocation) ->
+            {
+                positions.add(invocation.getArgument(1));
+                channels.add(invocation.getArgument(3));
+                if (positions.size() <= 2)
+                {
+                    throw new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150);
+                }
+                return CATCHUP_REPLAY_SESSION_ID;
+            });
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+        final ClusterMember follower = clusterMember(agent, CATCHUP_FOLLOWER_ID);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
+        slowTicks(agent, clock, SLOW_TICK_INTERVAL_NS);
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 2048, CATCHUP_FOLLOWER_ID, "localhost:30002");
+        slowTicks(agent, clock, 2 * CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
+
+        assertEquals(List.of(1024L, 2048L, 2048L), positions);
+        assertTrue(channels.get(2).contains("endpoint=localhost:30002"), channels.get(2));
+        assertEquals(CATCHUP_REPLAY_SESSION_ID, follower.catchupReplaySessionId());
+        assertEquals(List.of(), catchupReplayErrors());
+    }
+
+    @Test
+    void shouldPropagateCatchupReplayRefusalWithASpecificErrorCodeWithoutRetrying()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final ArchiveException refusal =
+            new ArchiveException("unknown recording id: 7", ArchiveException.UNKNOWN_RECORDING, 150);
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenThrow(refusal);
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+
+        assertSame(refusal, assertThrows(
+            ArchiveException.class,
+            () -> agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT)));
+        slowTicks(agent, clock, 2 * CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
+
+        verify(archive, times(1)).startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt());
+        assertEquals(List.of(), catchupReplayErrors());
+    }
+
+    @Test
+    void shouldPropagateCatchupReplayRefusalWithoutRetryingWhenArchiveIsNotConnected()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final ArchiveException refusal = new ArchiveException("client is closed");
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenAnswer(
+            (invocation) ->
+            {
+                when(archive.state()).thenReturn(AeronArchive.State.CLOSED);
+                throw refusal;
+            });
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+
+        assertSame(refusal, assertThrows(
+            ArchiveException.class,
+            () -> agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT)));
+        slowTicks(agent, clock, 2 * CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
+
+        verify(archive, times(1)).startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt());
+        assertEquals(List.of(), catchupReplayErrors());
+    }
+
+    private static AeronArchive connectedArchive()
+    {
+        final AeronArchive archive = mock(AeronArchive.class);
+        when(archive.state()).thenReturn(AeronArchive.State.CONNECTED);
+        when(archive.lastCorrelationId()).thenReturn(CATCHUP_REPLAY_CORRELATION_ID);
+        return archive;
+    }
+
+    private ConsensusModuleAgent newCatchupLeader(final TestClusterClock clock, final AeronArchive archive)
+    {
+        ctx.clusterMembers(CATCHUP_CLUSTER_MEMBERS)
+            .leaderHeartbeatTimeoutNs(CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS)
+            .epochClock(clock.asEpochClock())
+            .clusterClock(clock);
+
+        final Subscription archiveSubscription = mock(Subscription.class);
+        when(archiveSubscription.isConnected()).thenReturn(TRUE);
+        final RecordingSignalPoller recordingSignalPoller = mock(RecordingSignalPoller.class);
+        when(recordingSignalPoller.subscription()).thenReturn(archiveSubscription);
+
+        final ConsensusModuleAgent agent = new ConsensusModuleAgent(ctx);
+        agent.state(ConsensusModule.State.ACTIVE, "");
+        agent.role(Cluster.Role.LEADER);
+        agent.leadershipTermId(CATCHUP_LEADERSHIP_TERM_ID);
+        Tests.setField(agent, "appendPosition", mock(ReadableCounter.class));
+        Tests.setField(agent, "archive", archive);
+        Tests.setField(agent, "recordingSignalPoller", recordingSignalPoller);
+        Tests.setField(agent, "logRecordingId", CATCHUP_LOG_RECORDING_ID);
+
+        return agent;
+    }
+
+    private static ClusterMember clusterMember(final ConsensusModuleAgent agent, final int memberId)
+    {
+        return ClusterMember.findMember(Tests.getField(agent, "activeMembers"), memberId);
+    }
+
+    private static void slowTicks(final ConsensusModuleAgent agent, final TestClusterClock clock, final long durationNs)
+    {
+        final long endNs = clock.timeNanos() + durationNs;
+        final ClusterMember[] members = Tests.getField(agent, "activeMembers");
+        while (clock.timeNanos() < endNs)
+        {
+            clock.increment(SLOW_TICK_INTERVAL_MS);
+            for (final ClusterMember member : members)
+            {
+                member.timeOfLastAppendPositionNs(clock.timeNanos());
+            }
+            agent.doWork();
+        }
+    }
+
+    private List<Throwable> catchupReplayErrors()
+    {
+        final ArgumentCaptor<Throwable> captor = ArgumentCaptor.forClass(Throwable.class);
+        verify(ctx.countedErrorHandler(), atLeast(0)).onError(captor.capture());
+
+        final List<Throwable> errors = new ArrayList<>();
+        for (final Throwable error : captor.getAllValues())
+        {
+            if (String.valueOf(error.getMessage()).contains("catchup replay"))
+            {
+                errors.add(error);
+            }
+        }
+
+        return errors;
     }
 }
