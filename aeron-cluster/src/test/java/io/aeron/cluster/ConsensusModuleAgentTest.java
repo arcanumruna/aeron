@@ -1087,7 +1087,7 @@ class ConsensusModuleAgentTest
 
         slowTicks(agent, clock, CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
 
-        assertEquals(List.of(0L, 100L), offsetsMs(startNs, attemptTimesNs));
+        assertEquals(List.of(0L, 200L), offsetsMs(startNs, attemptTimesNs));
         assertEquals(CATCHUP_REPLAY_SESSION_ID, follower.catchupReplaySessionId());
         assertEquals(CATCHUP_REPLAY_CORRELATION_ID, follower.catchupReplayCorrelationId());
         verify(archive, times(2)).startReplay(
@@ -1119,7 +1119,7 @@ class ConsensusModuleAgentTest
         agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
         slowTicks(agent, clock, CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS - SLOW_TICK_INTERVAL_NS);
 
-        assertEquals(List.of(0L, 100L, 300L, 700L), offsetsMs(startNs, attemptTimesNs));
+        assertEquals(List.of(0L, 200L, 400L, 700L), offsetsMs(startNs, attemptTimesNs));
         assertEquals(List.of(), catchupReplayErrors());
 
         slowTicks(agent, clock, SLOW_TICK_INTERVAL_NS);
@@ -1135,11 +1135,13 @@ class ConsensusModuleAgentTest
 
     @ParameterizedTest
     @CsvSource({
-        "10000, 2000, 0 1250 3750",
-        "800, 200, 0 100 300",
-        "800, 650, 0 100 300 700",
-        "4000, 2000, 0 500 1500 3500",
-        "4000, 3200, 0 500 1500 3500"
+        "10000, 2000, 0 2500",
+        "1000, 200, 0 250",
+        "800, 200, 0 200",
+        "800, 650, 0 200 400 700",
+        "800, 700, 0 200 400 700",
+        "4000, 2000, 0 1000 2000",
+        "4000, 3200, 0 1000 2000 3500"
     })
     void shouldStartCatchupReplayOnTheFirstRetryAfterTheReleaseWindow(
         final long leaderHeartbeatTimeoutMs, final long releaseWindowMs, final String expectedAttemptOffsetsMs)
@@ -1147,18 +1149,8 @@ class ConsensusModuleAgentTest
         final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
         final AeronArchive archive = connectedArchive();
         final long startNs = clock.timeNanos();
-        final long releaseNs = startNs + TimeUnit.MILLISECONDS.toNanos(releaseWindowMs);
-        final List<Long> attemptTimesNs = new ArrayList<>();
-        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenAnswer(
-            (invocation) ->
-            {
-                attemptTimesNs.add(clock.timeNanos());
-                if (clock.timeNanos() < releaseNs)
-                {
-                    throw new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150);
-                }
-                return CATCHUP_REPLAY_SESSION_ID;
-            });
+        final List<Long> attemptTimesNs = refuseCatchupReplayUntil(
+            archive, clock, startNs + TimeUnit.MILLISECONDS.toNanos(releaseWindowMs));
         final long leaderHeartbeatTimeoutNs = TimeUnit.MILLISECONDS.toNanos(leaderHeartbeatTimeoutMs);
         final ConsensusModuleAgent agent = newCatchupLeader(clock, archive, leaderHeartbeatTimeoutNs);
         final ClusterMember follower = clusterMember(agent, CATCHUP_FOLLOWER_ID);
@@ -1177,30 +1169,98 @@ class ConsensusModuleAgentTest
     }
 
     @Test
-    void shouldRecordOneErrorAndStopRetryingWhenTheReleaseWindowOutlastsTheLeaderHeartbeatTimeout()
+    void shouldStartCatchupReplayAfterTheReleaseWindowWhenSlowTicksFallBetweenTheRetryOffsets()
     {
         final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
         final AeronArchive archive = connectedArchive();
         final long startNs = clock.timeNanos();
-        final long releaseNs = startNs + 2 * CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS;
+        final List<Long> attemptTimesNs = refuseCatchupReplayUntil(
+            archive, clock, startNs + TimeUnit.MILLISECONDS.toNanos(60));
+        final long leaderHeartbeatTimeoutNs = TimeUnit.MILLISECONDS.toNanos(100);
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive, leaderHeartbeatTimeoutNs);
+        final ClusterMember follower = clusterMember(agent, CATCHUP_FOLLOWER_ID);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
+        slowTicks(agent, clock, 2 * leaderHeartbeatTimeoutNs);
+
+        assertEquals(CATCHUP_REPLAY_SESSION_ID, follower.catchupReplaySessionId());
+        assertEquals(List.of(0L, 30L, 50L, 90L), offsetsMs(startNs, attemptTimesNs));
+        assertEquals(List.of(), catchupReplayErrors());
+    }
+
+    @Test
+    void shouldMakeOneCatchupReplayAttemptOnADelayedSlowTickAndKeepTheLaterRetryOffsets()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final long startNs = clock.timeNanos();
+        final long deadlineNs = startNs + CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS;
+        final List<Long> attemptTimesNs = refuseCatchupReplayUntil(archive, clock, Long.MAX_VALUE);
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
+        slowTicks(agent, clock, TimeUnit.MILLISECONDS.toNanos(190));
+        slowTick(agent, clock, 260);
+
+        assertEquals(List.of(0L, 450L), offsetsMs(startNs, attemptTimesNs));
+
+        slowTicks(agent, clock, deadlineNs - SLOW_TICK_INTERVAL_NS - clock.timeNanos());
+
+        assertEquals(List.of(0L, 450L, 700L), offsetsMs(startNs, attemptTimesNs));
+        assertEquals(List.of(), catchupReplayErrors());
+
+        slowTicks(agent, clock, SLOW_TICK_INTERVAL_NS);
+
+        assertOneCatchupReplayWarning(3, CLASHING_SESSION_ID_ERROR);
+    }
+
+    @Test
+    void shouldKeepTheCatchupReplayRetryOffsetsAndDeadlineFromReceiptWhenTheFirstRefusalIsSlow()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final long startNs = clock.timeNanos();
+        final long deadlineNs = startNs + CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS;
         final List<Long> attemptTimesNs = new ArrayList<>();
         when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenAnswer(
             (invocation) ->
             {
                 attemptTimesNs.add(clock.timeNanos());
-                if (clock.timeNanos() < releaseNs)
+                if (1 == attemptTimesNs.size())
                 {
-                    throw new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150);
+                    clock.increment(300);
                 }
-                return CATCHUP_REPLAY_SESSION_ID;
+                throw new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150);
             });
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
+        slowTicks(agent, clock, deadlineNs - SLOW_TICK_INTERVAL_NS - clock.timeNanos());
+
+        assertEquals(List.of(0L, 400L, 700L), offsetsMs(startNs, attemptTimesNs));
+        assertEquals(List.of(), catchupReplayErrors());
+
+        slowTicks(agent, clock, SLOW_TICK_INTERVAL_NS);
+
+        assertOneCatchupReplayWarning(3, CLASHING_SESSION_ID_ERROR);
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = { 710, 1600 })
+    void shouldRecordOneErrorAndStopRetryingWhenTheReleaseWindowOutlastsTheLastRetry(final long releaseWindowMs)
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final long startNs = clock.timeNanos();
+        final List<Long> attemptTimesNs = refuseCatchupReplayUntil(
+            archive, clock, startNs + TimeUnit.MILLISECONDS.toNanos(releaseWindowMs));
         final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
         final ClusterMember follower = clusterMember(agent, CATCHUP_FOLLOWER_ID);
 
         agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
         slowTicks(agent, clock, 3 * CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
 
-        assertEquals(List.of(0L, 100L, 300L, 700L), offsetsMs(startNs, attemptTimesNs));
+        assertEquals(List.of(0L, 200L, 400L, 700L), offsetsMs(startNs, attemptTimesNs));
         assertOneCatchupReplayWarning(4, CLASHING_SESSION_ID_ERROR);
         assertEquals(NULL_VALUE, follower.catchupReplaySessionId());
     }
@@ -1443,6 +1503,24 @@ class ConsensusModuleAgentTest
         return agent;
     }
 
+    private static List<Long> refuseCatchupReplayUntil(
+        final AeronArchive archive, final TestClusterClock clock, final long releaseNs)
+    {
+        final List<Long> attemptTimesNs = new ArrayList<>();
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenAnswer(
+            (invocation) ->
+            {
+                attemptTimesNs.add(clock.timeNanos());
+                if (clock.timeNanos() < releaseNs)
+                {
+                    throw new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150);
+                }
+                return CATCHUP_REPLAY_SESSION_ID;
+            });
+
+        return attemptTimesNs;
+    }
+
     private static ClusterMember clusterMember(final ConsensusModuleAgent agent, final int memberId)
     {
         return ClusterMember.findMember(Tests.getField(agent, "activeMembers"), memberId);
@@ -1451,16 +1529,21 @@ class ConsensusModuleAgentTest
     private static void slowTicks(final ConsensusModuleAgent agent, final TestClusterClock clock, final long durationNs)
     {
         final long endNs = clock.timeNanos() + durationNs;
-        final ClusterMember[] members = Tests.getField(agent, "activeMembers");
         while (clock.timeNanos() < endNs)
         {
-            clock.increment(SLOW_TICK_INTERVAL_MS);
-            for (final ClusterMember member : members)
-            {
-                member.timeOfLastAppendPositionNs(clock.timeNanos());
-            }
-            agent.doWork();
+            slowTick(agent, clock, SLOW_TICK_INTERVAL_MS);
         }
+    }
+
+    private static void slowTick(final ConsensusModuleAgent agent, final TestClusterClock clock, final long intervalMs)
+    {
+        clock.increment(intervalMs);
+        final ClusterMember[] members = Tests.getField(agent, "activeMembers");
+        for (final ClusterMember member : members)
+        {
+            member.timeOfLastAppendPositionNs(clock.timeNanos());
+        }
+        agent.doWork();
     }
 
     private static List<Long> offsetsMs(final long startNs, final List<Long> timesNs)
