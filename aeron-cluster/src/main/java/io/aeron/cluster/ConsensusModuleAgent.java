@@ -126,19 +126,19 @@ final class ConsensusModuleAgent
     static final short APPEND_POSITION_FLAG_NONE = 0;
     static final short APPEND_POSITION_FLAG_CATCHUP = 1;
 
-    /**
-     * The first retry of a refused catch-up replay waits the leader heartbeat timeout divided by this value, and
-     * each later retry waits twice as long as the one before, so attempts are made at 1/8, 3/8 and 7/8 of the
-     * timeout. A refusal caused by the media driver still holding the previous replay publication's session id
-     * clears once the driver releases it, one to two driver timer intervals after that replay stops. Any release
-     * within 7/8 of the timeout is therefore followed by an attempt; a refusal that outlasts the last attempt is
-     * reported once when the timeout expires.
-     */
-    static final int CATCHUP_REPLAY_FIRST_RETRY_DIVISOR = 8;
-
     private final long leaderHeartbeatIntervalNs;
     private final long leaderHeartbeatTimeoutNs;
-    private final long catchupReplayFirstRetryDelayNs;
+
+    /**
+     * A refused catch-up replay is retried at 1/4, 1/2 and 7/8 of the leader heartbeat timeout after the leader
+     * received the CatchupPosition, and given up at the full timeout. A refusal caused by the media driver still
+     * holding the previous replay publication's session id clears once the driver releases it, one to two driver
+     * timer intervals after that replay stops, which is 1/10 to 1/5 of the timeout with default settings, so the first
+     * retry normally succeeds. A slow tick that is late for an offset makes one attempt and skips any offset already
+     * passed. A refusal that outlasts the last attempt is reported once when the timeout expires.
+     */
+    private final long[] catchupReplayRetryOffsetsNs;
+
     private long unavailableCounterHandlerRegistrationId;
     private long leadershipTermId = NULL_VALUE;
     private long expectedAckPosition = 0;
@@ -231,7 +231,8 @@ final class ConsensusModuleAgent
         this.timerService = ctx.timerServiceSupplier().newInstance(clusterTimeUnit, this);
         this.leaderHeartbeatIntervalNs = ctx.leaderHeartbeatIntervalNs();
         this.leaderHeartbeatTimeoutNs = ctx.leaderHeartbeatTimeoutNs();
-        this.catchupReplayFirstRetryDelayNs = leaderHeartbeatTimeoutNs / CATCHUP_REPLAY_FIRST_RETRY_DIVISOR;
+        this.catchupReplayRetryOffsetsNs = new long[]{
+            leaderHeartbeatTimeoutNs / 4, leaderHeartbeatTimeoutNs / 2, leaderHeartbeatTimeoutNs / 8 * 7 };
         this.egressPublisher = ctx.egressPublisher();
         this.moduleState = ctx.moduleStateCounter();
         this.commitPosition = ctx.commitPositionCounter();
@@ -1170,19 +1171,20 @@ final class ConsensusModuleAgent
             {
                 pendingCatchupReplayByMemberIdMap.remove(followerMemberId);
 
+                final long receivedNs = clusterClock.timeNanos();
                 final String replayChannel = catchupReplayChannel(follower, catchupEndpoint);
                 final ArchiveException refusal = tryStartCatchupReplay(follower, logPosition, replayChannel);
                 if (null != refusal)
                 {
-                    final long nowNs = clusterClock.timeNanos();
                     final PendingCatchupReplay pending = new PendingCatchupReplay(
                         followerMemberId,
                         logPosition,
                         replayChannel,
-                        nowNs + leaderHeartbeatTimeoutNs,
-                        catchupReplayFirstRetryDelayNs,
+                        receivedNs,
+                        receivedNs + leaderHeartbeatTimeoutNs,
+                        catchupReplayRetryOffsetsNs,
                         refusal);
-                    pending.scheduleNextAttempt(nowNs);
+                    pending.scheduleNextAttempt(clusterClock.timeNanos());
                     pendingCatchupReplayByMemberIdMap.put(followerMemberId, pending);
                 }
             }
@@ -3836,8 +3838,10 @@ final class ConsensusModuleAgent
         final int followerMemberId;
         final long logPosition;
         final String replayChannel;
+        final long receivedNs;
         final long deadlineNs;
-        long retryDelayNs;
+        final long[] retryOffsetsNs;
+        int retryIndex;
         long nextAttemptNs;
         int attempts = 1;
         ArchiveException lastRefusal;
@@ -3846,22 +3850,28 @@ final class ConsensusModuleAgent
             final int followerMemberId,
             final long logPosition,
             final String replayChannel,
+            final long receivedNs,
             final long deadlineNs,
-            final long firstRetryDelayNs,
+            final long[] retryOffsetsNs,
             final ArchiveException lastRefusal)
         {
             this.followerMemberId = followerMemberId;
             this.logPosition = logPosition;
             this.replayChannel = replayChannel;
+            this.receivedNs = receivedNs;
             this.deadlineNs = deadlineNs;
-            this.retryDelayNs = firstRetryDelayNs;
+            this.retryOffsetsNs = retryOffsetsNs;
             this.lastRefusal = lastRefusal;
         }
 
         void scheduleNextAttempt(final long nowNs)
         {
-            nextAttemptNs = Math.min(nowNs + retryDelayNs, deadlineNs);
-            retryDelayNs <<= 1;
+            while (retryIndex < retryOffsetsNs.length && receivedNs + retryOffsetsNs[retryIndex] <= nowNs)
+            {
+                retryIndex++;
+            }
+
+            nextAttemptNs = retryIndex < retryOffsetsNs.length ? receivedNs + retryOffsetsNs[retryIndex] : deadlineNs;
         }
     }
 }
