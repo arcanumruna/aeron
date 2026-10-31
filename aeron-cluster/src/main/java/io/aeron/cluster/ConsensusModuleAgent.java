@@ -134,8 +134,10 @@ final class ConsensusModuleAgent
      * received the CatchupPosition, and given up at the full timeout. A refusal caused by the media driver still
      * holding the previous replay publication's session id clears once the driver releases it, one to two driver
      * timer intervals after that replay stops, which is 1/10 to 1/5 of the timeout with default settings, so the first
-     * retry normally succeeds. A slow tick that is late for an offset makes one attempt and skips any offset already
-     * passed. A refusal that outlasts the last attempt is reported once when the timeout expires.
+     * retry normally succeeds. A late tick makes one attempt, an offset that passes during a late tick or a slow
+     * refused attempt is skipped, and no attempt starts after the timeout, because the clock is read again for each
+     * pending retry and after each refusal. A refusal that outlasts the last attempt is reported once when the timeout
+     * expires.
      */
     private final long[] catchupReplayRetryOffsetsNs;
 
@@ -2454,7 +2456,7 @@ final class ConsensusModuleAgent
         }
 
         workCount += pollArchiveEvents();
-        workCount += retryPendingCatchupReplays(nowNs);
+        workCount += retryPendingCatchupReplays();
 
         workCount += sessionManager.sendRedirects(leadershipTermId, leaderMember.id(), nowNs);
         workCount += sessionManager.sendRejections(leadershipTermId, leaderMember.id(), nowNs);
@@ -3563,7 +3565,7 @@ final class ConsensusModuleAgent
         }
     }
 
-    private int retryPendingCatchupReplays(final long nowNs)
+    private int retryPendingCatchupReplays()
     {
         if (pendingCatchupReplayByMemberIdMap.isEmpty())
         {
@@ -3575,6 +3577,7 @@ final class ConsensusModuleAgent
         while (iterator.hasNext())
         {
             final PendingCatchupReplay pending = iterator.next();
+            final long nowNs = clusterClock.timeNanos();
             if (nowNs < pending.nextAttemptNs)
             {
                 continue;
@@ -3617,7 +3620,7 @@ final class ConsensusModuleAgent
                 else
                 {
                     pending.lastRefusal = refusal;
-                    pending.scheduleNextAttempt(nowNs);
+                    pending.scheduleNextAttempt(clusterClock.timeNanos());
                 }
             }
         }
