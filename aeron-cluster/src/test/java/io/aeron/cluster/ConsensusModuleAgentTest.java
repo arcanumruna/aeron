@@ -1245,6 +1245,72 @@ class ConsensusModuleAgentTest
         assertOneCatchupReplayWarning(3, CLASHING_SESSION_ID_ERROR);
     }
 
+    @Test
+    void shouldSkipTheCatchupReplayRetryOffsetsThatPassWhileARetryIsRefused()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final long startNs = clock.timeNanos();
+        final List<Long> attemptTimesNs = new ArrayList<>();
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenAnswer(
+            (invocation) ->
+            {
+                attemptTimesNs.add(clock.timeNanos());
+                if (2 == attemptTimesNs.size())
+                {
+                    clock.increment(450);
+                }
+                if (attemptTimesNs.size() < 3)
+                {
+                    throw new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150);
+                }
+                return CATCHUP_REPLAY_SESSION_ID;
+            });
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+        final ClusterMember follower = clusterMember(agent, CATCHUP_FOLLOWER_ID);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, CATCHUP_FOLLOWER_ID, CATCHUP_ENDPOINT);
+        slowTicks(agent, clock, 2 * CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
+
+        assertEquals(List.of(0L, 200L, 700L), offsetsMs(startNs, attemptTimesNs));
+        assertEquals(CATCHUP_REPLAY_SESSION_ID, follower.catchupReplaySessionId());
+        assertEquals(List.of(), catchupReplayErrors());
+    }
+
+    @Test
+    void shouldRecordTheCatchupReplayWarningWhenAnotherFollowersRefusedRetryRunsPastTheDeadline()
+    {
+        final TestClusterClock clock = new TestClusterClock(TimeUnit.MILLISECONDS);
+        final AeronArchive archive = connectedArchive();
+        final long startNs = clock.timeNanos();
+        final List<Long> attemptTimesNs = new ArrayList<>();
+        when(archive.startReplay(anyLong(), anyLong(), anyLong(), anyString(), anyInt())).thenAnswer(
+            (invocation) ->
+            {
+                attemptTimesNs.add(clock.timeNanos());
+                if (3 == attemptTimesNs.size())
+                {
+                    clock.increment(650);
+                }
+                throw new ArchiveException(CLASHING_SESSION_ID_ERROR, ArchiveException.GENERIC, 150);
+            });
+        final ConsensusModuleAgent agent = newCatchupLeader(clock, archive);
+
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, 1, "localhost:30001");
+        agent.onCatchupPosition(CATCHUP_LEADERSHIP_TERM_ID, 1024, 2, "localhost:30002");
+        slowTicks(agent, clock, 2 * CATCHUP_LEADER_HEARTBEAT_TIMEOUT_NS);
+
+        assertEquals(List.of(0L, 0L, 200L), offsetsMs(startNs, attemptTimesNs));
+        final List<Throwable> errors = catchupReplayErrors();
+        assertEquals(2, errors.size());
+        for (final Throwable error : errors)
+        {
+            assertEquals(AeronException.Category.WARN, assertInstanceOf(ClusterEvent.class, error).category());
+        }
+        assertTrue(errors.get(0).getMessage().contains(" attempts=1: "), errors.get(0).getMessage());
+        assertTrue(errors.get(1).getMessage().contains(" attempts=2: "), errors.get(1).getMessage());
+    }
+
     @ParameterizedTest
     @ValueSource(longs = { 710, 1600 })
     void shouldRecordOneErrorAndStopRetryingWhenTheReleaseWindowOutlastsTheLastRetry(final long releaseWindowMs)
