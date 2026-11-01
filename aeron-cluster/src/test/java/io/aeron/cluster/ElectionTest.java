@@ -1270,6 +1270,57 @@ class ElectionTest
     }
 
     @Test
+    void followerShouldLeaveLogReplicationThatEndsWithoutStopEvenWhenLeaderKeepsRefreshingDeadline()
+    {
+        final long term1Id = 1;
+        final long term2Id = 2;
+        final long term3Id = 3;
+        final long term1BaseLogPosition = 60;
+        final long term2BaseLogPosition = 120;
+        final ClusterMember[] clusterMembers = prepareClusterMembers();
+        final ClusterMember thisMember = clusterMembers[1];
+        final ClusterMember liveLeader = clusterMembers[0];
+        final RecordingReplication logReplication = mock(RecordingReplication.class);
+        final Election election = followerInLogReplication(
+            term1Id, term2Id, term1BaseLogPosition, term2BaseLogPosition, clusterMembers, thisMember, liveLeader,
+            logReplication);
+
+        when(logReplication.hasReplicationEnded()).thenReturn(true);
+        when(logReplication.hasSynced()).thenReturn(true);
+        when(logReplication.hasStopped()).thenReturn(false);
+        when(logReplication.position()).thenReturn(term1BaseLogPosition);
+
+        election.doWork(clock.increment(1));
+
+        final long quarterTimeoutNs = ctx.leaderHeartbeatTimeoutNs() / 4;
+        for (int i = 0; i < 3; i++)
+        {
+            clock.increment(quarterTimeoutNs);
+            refreshReplicationDeadline(
+                election, term1Id, term2Id, term1BaseLogPosition, term2BaseLogPosition, liveLeader);
+            election.doWork(clock.nanoTime());
+        }
+
+        clock.increment(quarterTimeoutNs - 1);
+        refreshReplicationDeadline(
+            election, term1Id, term2Id, term1BaseLogPosition, term2BaseLogPosition, liveLeader);
+        election.doWork(clock.nanoTime());
+        verify(electionStateCounter, times(1)).setRelease(ElectionState.CANVASS.code());
+        verify(logReplication, never()).close();
+
+        clock.increment(1);
+        election.onCommitPosition(term3Id, term1BaseLogPosition, liveLeader.id());
+        final TimeoutException ex = assertThrows(TimeoutException.class, () -> election.doWork(clock.nanoTime()));
+
+        election.handleError(clock.nanoTime(), ex);
+        verify(electionStateCounter, times(2)).setRelease(ElectionState.INIT.code());
+
+        election.doWork(clock.increment(1));
+        verify(logReplication).close();
+        verify(electionStateCounter, times(2)).setRelease(ElectionState.CANVASS.code());
+    }
+
+    @Test
     void followerShouldProgressThroughFailedElectionsTermsImmediatelyPriorToCurrent()
     {
         final long term1Id = 1;
@@ -2316,6 +2367,31 @@ class ElectionTest
             consensusPublisher,
             ctx,
             consensusModuleAgent);
+    }
+
+    private void refreshReplicationDeadline(
+        final Election election,
+        final long term1Id,
+        final long term2Id,
+        final long commitPosition,
+        final long term2BaseLogPosition,
+        final ClusterMember liveLeader)
+    {
+        election.onCommitPosition(term2Id, commitPosition, liveLeader.id());
+        election.onNewLeadershipTerm(
+            term1Id,
+            term2Id,
+            term2BaseLogPosition,
+            term2BaseLogPosition,
+            term2Id,
+            term2BaseLogPosition,
+            term2BaseLogPosition,
+            NULL_POSITION,
+            RECORDING_ID,
+            clock.nanoTime(),
+            liveLeader.id(),
+            0,
+            false);
     }
 
     private Election followerInLogReplication(
