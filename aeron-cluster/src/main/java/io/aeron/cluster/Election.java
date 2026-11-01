@@ -968,6 +968,14 @@ class Election
                     throw new TimeoutException("timeout awaiting commit position", AeronException.Category.WARN);
                 }
             }
+            else if (logReplication.hasReplicationEnded() && nowNs >= replicationDeadlineNs)
+            {
+                // REPLICATE_END can precede STOP, but an "in sync" replication never signals STOP.
+                throw new TimeoutException(
+                    "log replication ended without stop, position=" + logReplication.position() +
+                    " stopPosition=" + replicationStopPosition,
+                    AeronException.Category.WARN);
+            }
         }
 
         return workCount;
