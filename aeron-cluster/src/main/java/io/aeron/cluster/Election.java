@@ -89,6 +89,7 @@ class Election
     private long replicationLeadershipTermId = NULL_VALUE;
     private long replicationStopPosition = NULL_POSITION;
     private long replicationDeadlineNs;
+    private long replicationEndedDeadlineNs = NULL_VALUE;
     private long replicationTermBaseLogPosition;
     private long leaderRecordingId = NULL_VALUE;
     private long leadershipTermId;
@@ -968,13 +969,22 @@ class Election
                     throw new TimeoutException("timeout awaiting commit position", AeronException.Category.WARN);
                 }
             }
-            else if (logReplication.hasReplicationEnded() && nowNs >= replicationDeadlineNs)
+            else if (logReplication.hasReplicationEnded())
             {
-                // REPLICATE_END can precede STOP, but an "in sync" replication never signals STOP.
-                throw new TimeoutException(
-                    "log replication ended without stop, position=" + logReplication.position() +
-                    " stopPosition=" + replicationStopPosition,
-                    AeronException.Category.WARN);
+                // REPLICATE_END can precede STOP, but an "in sync" replication never signals STOP. Leader messages
+                // keep extending replicationDeadlineNs, so the wait for STOP has its own deadline, armed once.
+                if (NULL_VALUE == replicationEndedDeadlineNs)
+                {
+                    replicationEndedDeadlineNs = nowNs + ctx.leaderHeartbeatTimeoutNs();
+                }
+
+                if (nowNs >= replicationDeadlineNs || nowNs >= replicationEndedDeadlineNs)
+                {
+                    throw new TimeoutException(
+                        "log replication ended without stop, position=" + logReplication.position() +
+                        " stopPosition=" + replicationStopPosition,
+                        AeronException.Category.WARN);
+                }
             }
         }
 
@@ -1498,6 +1508,7 @@ class Election
             logReplication = null;
         }
         replicationDeadlineNs = 0;
+        replicationEndedDeadlineNs = NULL_VALUE;
         lastPublishedCommitPosition = 0;
     }
 
@@ -1659,6 +1670,7 @@ class Election
             ", replicationLeadershipTermId=" + replicationLeadershipTermId +
             ", replicationStopPosition=" + replicationStopPosition +
             ", replicationDeadlineNs=" + replicationDeadlineNs +
+            ", replicationEndedDeadlineNs=" + replicationEndedDeadlineNs +
             ", replicationTermBaseLogPosition=" + replicationTermBaseLogPosition +
             ", leaderRecordingId=" + leaderRecordingId +
             ", leadershipTermId=" + leadershipTermId +
