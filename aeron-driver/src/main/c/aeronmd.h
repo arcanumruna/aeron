@@ -87,6 +87,11 @@ bool aeron_driver_context_get_dir_delete_on_shutdown(aeron_driver_context_t *con
  */
 #define AERON_TO_CONDUCTOR_BUFFER_LENGTH_ENV_VAR "AERON_CONDUCTOR_BUFFER_LENGTH"
 
+/**
+ * Capacity (in bytes, power of two) of each internal conductor, sender and receiver command queue.
+ */
+#define AERON_DRIVER_COMMAND_QUEUE_CAPACITY_ENV_VAR "AERON_DRIVER_COMMAND_QUEUE_CAPACITY"
+
 int aeron_driver_context_set_to_conductor_buffer_length(aeron_driver_context_t *context, size_t length);
 size_t aeron_driver_context_get_to_conductor_buffer_length(aeron_driver_context_t *context);
 

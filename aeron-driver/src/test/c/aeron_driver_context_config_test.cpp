@@ -21,6 +21,7 @@
 
 #include "aeron_test_base.h"
 #include "aeronmd.h"
+#include "aeron_driver_context.h"
 
 using namespace aeron;
 
@@ -35,6 +36,9 @@ protected:
     {
         aeron_env_unset(AERON_RECEIVER_IO_VECTOR_CAPACITY_ENV_VAR);
         aeron_env_unset(AERON_SENDER_IO_VECTOR_CAPACITY_ENV_VAR);
+        aeron_env_unset(AERON_NAK_UNICAST_DELAY_ENV_VAR);
+        aeron_env_unset(AERON_NAK_UNICAST_RETRY_DELAY_RATIO_ENV_VAR);
+        aeron_env_unset(AERON_DRIVER_COMMAND_QUEUE_CAPACITY_ENV_VAR);
     }
 };
 
@@ -303,4 +307,20 @@ TEST_F(DriverContextConfigTest, shouldFailInitIfNakDelayComboIsOutOfBounds)
     EXPECT_NE(
         std::string::npos,
         std::string(aeron_errmsg()).find("nak_unicast_delay_ns (1000000000000000) * nak_unicast_retry_delay_ratio (567890473482340000) exceeds 9223372036854775807"));
+}
+
+TEST_F(DriverContextConfigTest, shouldSizeCommandQueuesFromEnv)
+{
+    aeron_driver_context_t *context;
+
+    EXPECT_EQ(0, aeron_driver_context_init(&context));
+    EXPECT_EQ((size_t)AERON_COMMAND_RB_CAPACITY * 1024, context->conductor_command_queue.capacity);
+    aeron_driver_context_close(context);
+
+    aeron_env_set(AERON_DRIVER_COMMAND_QUEUE_CAPACITY_ENV_VAR, "1m");
+    EXPECT_EQ(0, aeron_driver_context_init(&context));
+    EXPECT_EQ((size_t)1024 * 1024, context->conductor_command_queue.capacity);
+    EXPECT_EQ((size_t)1024 * 1024, context->sender_command_queue.capacity);
+    EXPECT_EQ((size_t)1024 * 1024, context->receiver_command_queue.capacity);
+    aeron_driver_context_close(context);
 }
