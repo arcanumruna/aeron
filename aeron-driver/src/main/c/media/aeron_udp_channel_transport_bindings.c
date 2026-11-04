@@ -52,7 +52,7 @@ aeron_udp_channel_transport_bindings_t aeron_udp_channel_transport_bindings_defa
         {
             "default",
             "media",
-            NULL,
+            &aeron_udp_channel_transport_bindings_default,
         }
     };
 
@@ -104,7 +104,10 @@ aeron_udp_channel_transport_bindings_t *aeron_udp_channel_transport_bindings_loa
         return NULL;
     }
 
-    bindings->meta_info.source_symbol = bindings;
+    if (NULL == bindings->meta_info.source_symbol)
+    {
+        bindings->meta_info.source_symbol = bindings;
+    }
 
     return bindings;
 }

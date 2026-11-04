@@ -14,14 +14,22 @@
  * limitations under the License.
  */
 
+#include <atomic>
 #include <functional>
+#include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
 #include "aeron_test_base.h"
 #include "aeronmd.h"
+
+extern "C"
+{
 #include "aeron_driver_context.h"
+#include "media/aeron_udp_channel_transport_bindings.h"
+}
 
 using namespace aeron;
 
@@ -323,4 +331,38 @@ TEST_F(DriverContextConfigTest, shouldSizeCommandQueuesFromEnv)
     EXPECT_EQ((size_t)1024 * 1024, context->sender_command_queue.capacity);
     EXPECT_EQ((size_t)1024 * 1024, context->receiver_command_queue.capacity);
     aeron_driver_context_close(context);
+}
+
+TEST_F(DriverContextConfigTest, shouldInitContextsConcurrentlyWithoutWritingSharedBindings)
+{
+    std::vector<std::thread> threads;
+    std::atomic<int> failures{ 0 };
+
+    for (int t = 0; t < 4; t++)
+    {
+        threads.emplace_back(
+            [&failures]()
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    aeron_driver_context_t *context;
+                    if (0 != aeron_driver_context_init(&context))
+                    {
+                        failures++;
+                        continue;
+                    }
+                    aeron_driver_context_close(context);
+                }
+            });
+    }
+
+    for (auto &thread : threads)
+    {
+        thread.join();
+    }
+
+    EXPECT_EQ(0, failures.load());
+    aeron_udp_channel_transport_bindings_t *bindings = aeron_udp_channel_transport_bindings_load_media("default");
+    ASSERT_NE(nullptr, bindings);
+    EXPECT_EQ((const void *)bindings, bindings->meta_info.source_symbol);
 }
